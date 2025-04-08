@@ -20,9 +20,6 @@ def positional_encoding_2D_HF(emb_dim, height, width, base_size):
     pos_h = pos_h.reshape(-1)
     pos_w = pos_w.reshape(-1)
 
-    # Using torch.linspace would make more sense:
-    # div_term = 1.0 / (10000.0 ** pt.linspace(0.0, 1.0, steps=emb_dim//4, dtype=pt.float64))
-    # But in huggingface, this is how it's done:
     div_term = 1.0 / (10000.0 ** (pt.arange(emb_dim // 4, dtype=pt.float64) / (emb_dim / 4.0)))
     
     out = pt.cat([
@@ -32,17 +29,18 @@ def positional_encoding_2D_HF(emb_dim, height, width, base_size):
         pt.cos(pos_w.outer(div_term)),
     ], dim=-1)
 
-    return out
+    return out.to(pt.float32)
 
 
 if __name__ == "__main__":
-    B, C, H, W = 16, 256, 40, 30
+    B, C, H, W = 16, 256, 96, 96
     t = pt.rand((B,))
     temb = get_sinusoidal_embedding(t, C)
     temb2 = F2.sinusoidal_embedding(t, C)
     print(f"sinusodial embeddings diff: {pt.norm(temb - temb2)}")
 
-    PE = positional_encoding_2D_HF(C, H, W, 1)
-    PE2 = F2.positional_embedding(C, H, W, 1)
+    base_size = 64
+    PE = positional_encoding_2D_HF(C, H, W, base_size)
+    PE2 = F2.positional_embedding(C, H, W, base_size)
     print(f"Positional embeddings diff: {pt.norm(PE - PE2)}")
     import code; code.interact(local=locals())

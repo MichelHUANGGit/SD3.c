@@ -27,30 +27,29 @@ def main(B, C_in, C_out, H, W, kernel_size, stride, padding):
 
 
     out = F.conv2d(x, kernel, bias, stride, padding)
-    out2 = F2.conv2d_test(x, kernel, bias, stride, padding)
+    out2 = F2.conv2d(x, kernel, bias, stride, padding)
 
     # out3 = conv2d(x)
 
-    print(pt.norm(out - out2))
+    print((out - out2).abs().max().item())
     # print(pt.norm(out2 - out3))
     # print(pt.norm(out - out3))
 
 
 if __name__ == "__main__":
-    interact(local=locals())
 
     # Parameters
     main(
         B=2, C_in=1, C_out=1, H=32, W=32, kernel_size=(2,3), stride=1, padding=0
     )
     main(
-        B=2, C_in=1, C_out=1, H=32, W=32, kernel_size=(4,2), stride=1, padding=0
+        B=2, C_in=3, C_out=1, H=32, W=32, kernel_size=(4,2), stride=1, padding=0
     )
     main(
         B=2, C_in=1, C_out=1, H=32, W=32, kernel_size=(3,3), stride=1, padding=3
     )
     main(
-        B=2, C_in=1, C_out=1, H=6, W=6, kernel_size=(3,3), stride=2, padding=1
+        B=2, C_in=1, C_out=2, H=6, W=6, kernel_size=(3,3), stride=2, padding=1
     )
     main(
         B=2, C_in=16, C_out=32, H=128, W=128, kernel_size=(3,5), stride=2, padding=2

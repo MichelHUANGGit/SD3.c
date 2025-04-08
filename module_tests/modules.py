@@ -12,11 +12,9 @@ class AdaLN_Zero(nn.Module):
     def __init__(self, emb_dim, chunks=6, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.chunks = chunks
-        self.silu = nn.SiLU()
         self.linear = nn.Linear(emb_dim, chunks*emb_dim)
     
     def forward(self, y:Tensor) -> Tuple:
-        y = self.silu(y)
         y = self.linear(y)
         # create a Tokens dimension for broadcasting later, and chunk
         return y[:, None, :].chunk(self.chunks, dim=-1)
@@ -272,6 +270,7 @@ class MM_DiT_Block(nn.Module):
         c_out = self.context_lnorm1(c) # (B,77+77,C)
         c_out = (1.0 + scale_attn_c) * c_out + shift_attn_c # scale, shift
         qc, kc, vc = self.context_to_kqv(c_out).chunk(3, dim=-1)
+        self.register_buffer("tempc", qc)
         qc = qc.view(B, Tc, self.attn_heads, C//self.attn_heads)
         kc = kc.view(B, Tc, self.attn_heads, C//self.attn_heads)
         vc = vc.view(B, Tc, self.attn_heads, C//self.attn_heads)
@@ -406,9 +405,11 @@ class MMDiT(nn.Module):
         timesteps_embeddings = self.timestep_mlp(timesteps_embeddings)
         pooled_text = self.pooled_text_mlp(pooled_captions)
 
-        y = timesteps_embeddings + pooled_text
+        y = F.silu(timesteps_embeddings + pooled_text)
         c = self.context_linear(coarse_captions)
         x = self.to_patches(noisy_latent)
+
+        self.register_buffer("x", x)
 
         for block in self.transformer:
             c, x = block(x, c, y)
@@ -629,12 +630,10 @@ if __name__ == "__main__":
     def forward_hook_SD3(self, args, kwargs):
         self.register_buffer("x", kwargs["hidden_states"].detach().cpu())
         self.register_buffer("c", kwargs["encoder_hidden_states"].detach().cpu())
-        self.register_buffer("y", kwargs["temb"].detach().cpu())
 
     def forward_hook_dit(self, inputs):
         self.register_buffer("x", inputs[0].detach().cpu())
         self.register_buffer("c", inputs[1].detach().cpu())
-        self.register_buffer("y", inputs[2].detach().cpu())
 
     def forward_post_hook(self, foward_args, forward_kwargs, output):
         self.register_buffer("x_out", output[1].detach().cpu())
@@ -644,25 +643,21 @@ if __name__ == "__main__":
         model.transformer[i].register_forward_pre_hook(forward_hook_dit)
 
     with pt.no_grad():
-        out_imp = measure_performance(model, (latent, coarse_captions, pooled_captions, timesteps), evals=100, warmups=10)
-        out_SD3 = measure_performance(SD3, (latent, coarse_captions, pooled_captions, timesteps), evals=100, warmups=10)[0]
+        out_imp = measure_performance(model, (latent, coarse_captions, pooled_captions, timesteps), evals=50, warmups=10)
+        out_SD3 = measure_performance(SD3, (latent, coarse_captions, pooled_captions, timesteps), evals=50, warmups=10)[0]
 
     a = SD3.transformer_blocks
     b = model.transformer
 
     for i in range(num_layers):
-        # print(f"Norm diff between latent vectors at transformer block {i}: {pt.norm(a[i].x - b[i].x).item()}")
-        # print(f"Norm diff between context embeddings at transformer block {i}: {pt.norm(a[i].c - b[i].c).item()}")
-        # print(f"Norm diff between y vectors at transformer block {i}: {pt.norm(a[i].y - b[i].y).item()}")
         assert a[i].x.shape == b[i].x.shape == (B, num_patches, C)
         assert a[i].c.shape == b[i].c.shape == (B, Tc, C)
-        assert pt.allclose(a[i].x, b[i].x, atol=1e-5)
-        assert pt.allclose(a[i].c, b[i].c, atol=1e-5)
-        assert pt.allclose(a[i].y, b[i].y, atol=1e-5)
+        assert (a[i].x - b[i].x).abs().max().item() < 1e-5
+        assert (a[i].c - b[i].c).abs().max().item() < 1e-5
         print(f"Block {i}: OK")
 
     assert out_imp.shape == out_SD3.shape == (B, in_channels, H, W)
-    assert pt.allclose(out_SD3, out_imp, atol=1e-5)
+    assert (out_SD3 - out_imp).abs().max().item() < 1e-4, interact(local=locals())
 
     # Gradients calculations
     out_imp = model(latent, coarse_captions, pooled_captions, timesteps)

@@ -4,12 +4,14 @@ import custom_modules_cpp
 
 
 if __name__ == "__main__":
-    B,T = 2,3
-    C_in, C_hid, C_out = 4,8,4
-    activation = "SiLU"
+    B,T = 2,144
+    C_in, C_hid, C_out = 256,1024,256
+    activation = "GELU"
+    kwargs = {"approximate" : "tanh"} if activation == "GELU" else {}
 
     lin1 = nn.Linear(C_in, C_hid)
-    act = getattr(nn, activation)()
+    act = getattr(nn, activation)(**kwargs)
+    # act = nn.GELU(approximate="tanh")
     lin2 = nn.Linear(C_hid, C_out)
 
     x = pt.randn((B, C_in))

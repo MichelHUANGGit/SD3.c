@@ -1,4 +1,5 @@
 import torch as pt
+from torch.nn.functional import silu
 import custom_modules_cpp as F
 from code import interact
 from inspect import signature
@@ -6,10 +7,10 @@ from modules import MM_DiT_Block
 
 # Parameters
 B,H,W = 2, 64, 64
-Tc, Tx = 77+77, 128
-emb_dim = 512
-attn_heads = 2
-mlp_expand = 4
+Tc, Tx = 77+77, 156
+emb_dim = 256
+attn_heads = 4
+mlp_expand = 2
 discard_context = False
 use_dual_attention = True
 use_kq_norm = True
@@ -20,13 +21,12 @@ COPY_WEIGHTS = True
 DiT_block = MM_DiT_Block(emb_dim, attn_heads, mlp_expand, discard_context, use_dual_attention, use_kq_norm)
 
 x = pt.randn((B, Tx, emb_dim))
-y = pt.randn((B, emb_dim))
+y = silu(pt.randn((B, emb_dim)))
 c = pt.randn((B, Tc, emb_dim))
 c_clone = c.clone()
 x_clone = x.clone()
 y_clone = y.clone()
 
-# interact(local=locals())
 
 if COPY_WEIGHTS:
     c_adalnormW = DiT_block.context_ada_lnorm.linear.weight.data.T.contiguous()
@@ -39,48 +39,32 @@ if COPY_WEIGHTS:
         rmsnorm_weight = pt.ones((emb_dim//attn_heads))
 
     # context
-    c_Wq = DiT_block.context_to_kqv.weight.data[:emb_dim, :].T.contiguous()
-    c_Wk = DiT_block.context_to_kqv.weight.data[emb_dim:2*emb_dim, :].T.contiguous()
-    c_Wv = DiT_block.context_to_kqv.weight.data[2*emb_dim:, :].T.contiguous()
-    c_Wo = DiT_block.context_attn_Wout.weight.data.T.contiguous() if not discard_context else pt.empty((emb_dim, emb_dim))
+    c_Wqkv = DiT_block.context_to_kqv.weight.data.T.contiguous()
+    c_bqkv = DiT_block.context_to_kqv.bias.data.clone()
 
-    c_bq = DiT_block.context_to_kqv.bias.data[:emb_dim].clone()
-    c_bk = DiT_block.context_to_kqv.bias.data[emb_dim:2*emb_dim].clone()
-    c_bv = DiT_block.context_to_kqv.bias.data[2*emb_dim:].clone()
-    c_bo = DiT_block.context_attn_Wout.bias.data.clone() if not discard_context else pt.empty((emb_dim,))
+    c_Wout = DiT_block.context_attn_Wout.weight.data.T.contiguous() if not discard_context else pt.empty((emb_dim, emb_dim))
+    c_bout = DiT_block.context_attn_Wout.bias.data.clone() if not discard_context else pt.empty((emb_dim,))
 
     # latent
-    Wq = DiT_block.latent_to_kqv.weight.data[:emb_dim, :].T.contiguous()
-    Wk = DiT_block.latent_to_kqv.weight.data[emb_dim:2*emb_dim, :].T.contiguous()
-    Wv = DiT_block.latent_to_kqv.weight.data[2*emb_dim:, :].T.contiguous()
-    Wo = DiT_block.latent_attn_Wout.weight.data.T.contiguous()
+    x_Wqkv = DiT_block.latent_to_kqv.weight.data.T.contiguous()
+    x_bqkv = DiT_block.latent_to_kqv.bias.data.clone()
 
-    bq = DiT_block.latent_to_kqv.bias.data[:emb_dim].clone()
-    bk = DiT_block.latent_to_kqv.bias.data[emb_dim:2*emb_dim].clone()
-    bv = DiT_block.latent_to_kqv.bias.data[2*emb_dim:].clone()
-    bo = DiT_block.latent_attn_Wout.bias.data.clone()
+    x_Wout = DiT_block.latent_attn_Wout.weight.data.T.contiguous()
+    x_bout = DiT_block.latent_attn_Wout.bias.data.clone()
 
     # dual
     if use_dual_attention:
-        Wq2 = DiT_block.latent_to_kqv_x2.weight.data[:emb_dim, :].T.contiguous()
-        Wk2 = DiT_block.latent_to_kqv_x2.weight.data[emb_dim:2*emb_dim, :].T.contiguous()
-        Wv2 = DiT_block.latent_to_kqv_x2.weight.data[2*emb_dim:, :].T.contiguous()
-        Wo2 = DiT_block.latent_attn_Wout_x2.weight.data.T.contiguous()
+        x2_Wqkv = DiT_block.latent_to_kqv_x2.weight.data.T.contiguous()
+        x2_bqkv = DiT_block.latent_to_kqv_x2.bias.data.clone()
 
-        bq2 = DiT_block.latent_to_kqv_x2.bias.data[:emb_dim].clone()
-        bk2 = DiT_block.latent_to_kqv_x2.bias.data[emb_dim:2*emb_dim].clone()
-        bv2 = DiT_block.latent_to_kqv_x2.bias.data[2*emb_dim:].clone()
-        bo2 = DiT_block.latent_attn_Wout_x2.bias.data.clone()
+        x2_Wout = DiT_block.latent_attn_Wout_x2.weight.data.T.contiguous()
+        x2_bout = DiT_block.latent_attn_Wout_x2.bias.data.clone()
     else:
-        Wq2 = pt.empty((emb_dim, emb_dim)).uniform_(*init_range)
-        Wk2 = pt.empty((emb_dim, emb_dim)).uniform_(*init_range)
-        Wv2 = pt.empty((emb_dim, emb_dim)).uniform_(*init_range)
-        Wo2 = pt.empty((emb_dim, emb_dim)).uniform_(*init_range)
+        x2_Wqkv = pt.empty((emb_dim, 3*emb_dim)).uniform_(*init_range)
+        x2_Wout = pt.empty((emb_dim, emb_dim)).uniform_(*init_range)
 
-        bq2 = pt.empty((emb_dim,)).uniform_(*init_range)
-        bk2 = pt.empty((emb_dim,)).uniform_(*init_range)
-        bv2 = pt.empty((emb_dim,)).uniform_(*init_range)
-        bo2 = pt.empty((emb_dim,)).uniform_(*init_range)
+        x2_bqkv = pt.empty((3*emb_dim,)).uniform_(*init_range)
+        x2_bout = pt.empty((emb_dim,)).uniform_(*init_range)
 
     # mlp
     if not discard_context:
@@ -101,8 +85,10 @@ if COPY_WEIGHTS:
 
 
 else:
-    c_adalnormW = pt.empty((emb_dim, 6*emb_dim)).uniform_(*init_range)
-    c_adalnormb = pt.empty((6*emb_dim)).uniform_(*init_range)
+    context_chunks = 6 if not discard_context else 2
+
+    c_adalnormW = pt.empty((emb_dim, context_chunks*emb_dim)).uniform_(*init_range)
+    c_adalnormb = pt.empty((context_chunks*emb_dim)).uniform_(*init_range)
     chunks = 9 if use_dual_attention else 6
     x_adalnormW = pt.empty((emb_dim, chunks*emb_dim)).uniform_(*init_range)
     # print([pt.max(chunk).item() for chunk in x_adalnormW.chunk(chunks, -1)])
@@ -154,20 +140,24 @@ else:
 with pt.no_grad():
     c_out_true, x_out_true = DiT_block.forward(x, c, y)
 
+
 c_out, x_out = F.Dit_block(
     y, c, x, 
     # context
     c_adalnormW, c_adalnormb,
-    c_Wq, c_Wk, c_Wv, c_bq, c_bk, c_bv,
+    c_Wqkv, c_bqkv,
     rmsnorm_weight, rmsnorm_weight,
-    c_Wo, c_bo,
+    c_Wout, c_bout,
     c_mlp_W1, c_mlp_b1, c_mlp_W2, c_mlp_b2,
     # latent
     x_adalnormW, x_adalnormb,
-    Wq, Wk, Wv, bq, bk, bv,
-    Wq2, Wk2, Wv2, bq2, bk2, bv2,
-    rmsnorm_weight, rmsnorm_weight, rmsnorm_weight, rmsnorm_weight,
-    Wo, bo, Wo2, bo2,
+    x_Wqkv, x_bqkv,
+    rmsnorm_weight, rmsnorm_weight, 
+    x_Wout, x_bout,
+    # dual latent
+    x2_Wqkv, x2_bqkv,
+    rmsnorm_weight, rmsnorm_weight,
+    x2_Wout, x2_bout,
     mlp_W1, mlp_b1, mlp_W2, mlp_b2,
     # others
     B, Tc, Tx, emb_dim, attn_heads, mlp_expand, use_dual_attention, use_kq_norm, discard_context
