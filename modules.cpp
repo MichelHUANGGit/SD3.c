@@ -511,39 +511,26 @@ void linear(float* x, float* W, float* b, float* y, int B, int C_in, int C_out){
     }
 }
 
-void to_qkv(float* x, float* Wqkv, float* bias_qkv, float* query, float* key, float* value, int B, int C_in, int C_out){
-    // x @ Wqkv + bias (B, 3*C_out) -> split into query key value
-    for (int m=0; m<B; m++){
+void partial_linear(float* x, float* W, float* b, float* y, int M, int K, int N, int Nmax, int n0){
+    // Inputs: x (M,K), W(K,Nmax), b(Nmax), y(M,N)
+    // where Nmax > N, e.g. Nmax could be 3 * N for a query/key/value projection, but we only we want to compute the key projection
+    // Perform y = x @ W[:,n0:n0+N] + b[n0:n0+N] -> (M, N)
 
-        // Pointers
-        float* x_m = x + m * C_in;
-        float* Wk = Wqkv + C_out; /*Points to Wqkv[0, C_out], the next C_out elements correspond to the weights of Wk[0,:]*/
-        float* Wv = Wqkv + 2 * C_out; /*Points to Wqkv[0, 2*C_out], the next C_out elements correspond to the weights of Wv[0,:]*/
-
-        for (int n=0; n<C_out; n++){
-            float dot_product_accum_query = bias_qkv[n];
-            float dot_product_accum_key = bias_qkv[C_out + n];
-            float dot_product_accum_value = bias_qkv[2 * C_out + n];
-
-            for (int k=0; k<C_in; k++){
-                const float x_mk = x_m[k];
-                // += x[m,k] * W[k,n]
-                dot_product_accum_query += x_mk * Wqkv[k * 3 * C_out + n];
-                // += x[m,k] * W[k,C_out + n]
-                dot_product_accum_key += x_mk * Wk[k * 3 * C_out + n];
-                // += x[m,k] * W[k,2*C_out + n]
-                dot_product_accum_value += x_mk * Wv[k * 3 * C_out + n];
-            }
+    for (int m=0; m<M; m++){
+        for (int n=0; n<N; n++){
             
-            // Write results
-            query[m * C_out + n] = dot_product_accum_query;
-            key[m * C_out + n] = dot_product_accum_key;
-            value[m * C_out + n] = dot_product_accum_value;
-        }
+            float* x_m = x + m * K; /*Pointer to x[m,0]*/
 
+            float dot_product_accum = b[n0 + n];
+            for (int k=0; k<K; k++){
+                // dot_product_accum += x[m][k] * W[k][n0+n];
+                dot_product_accum += x_m[k] * W[k * Nmax + n0 + n];
+            }
+            // write result at y[m][n]
+            y[m * N + n] = dot_product_accum;
+        }
     }
 }
-
 
 void add(float* input, float* other, float* output, long long size){
     // element-wise add
@@ -1414,18 +1401,24 @@ void dit_block(
     // and x refers to the latent vector
     const int T = Tx + Tc;
     const int head_dim = emb_dim / attn_heads;
+    float* y_buffer1;
+    float* y_buffer2;
 
     // ***************************************************** MAIN PART ***********************************************************
 
     // *********************************** Pre-attention Context **********************************
-    adaptative_layernorm_zero(y, c_shift_scale_gate, c_ada_lnorm_weights, c_ada_lnorm_biases, B, emb_dim);
     // c_hid = layernorm(c, weight=None, bias=None, save_for_backward=False)
     layernorm(c, c_hid, nullptr, nullptr, nullptr, nullptr, 1e-6, B, Tc, emb_dim);
+
     // c_hid = c_hid * (1.0 + scale_attn_context) + shift_attn_context
+    // partial_linear(y, )
+    adaptative_layernorm_zero(y, c_shift_scale_gate, c_ada_lnorm_weights, c_ada_lnorm_biases, B, emb_dim);
     if (!discard_context) scale_and_shift(c_hid, c_hid, c_shift_scale_gate[0], c_shift_scale_gate[1], B, Tc, emb_dim);
     else scale_and_shift(c_hid, c_hid, c_shift_scale_gate[1], c_shift_scale_gate[0], B, Tc, emb_dim);
     // Wqkv projections
-    to_qkv(c_hid, c_Wqkv, c_bias_qkv, c_query, c_key, c_value, B*Tc, emb_dim, emb_dim);
+    partial_linear(c_hid, c_Wqkv, c_bias_qkv, c_query, B*Tc, emb_dim, emb_dim, 3*emb_dim, 0*emb_dim);
+    partial_linear(c_hid, c_Wqkv, c_bias_qkv, c_key  , B*Tc, emb_dim, emb_dim, 3*emb_dim, 1*emb_dim);
+    partial_linear(c_hid, c_Wqkv, c_bias_qkv, c_value, B*Tc, emb_dim, emb_dim, 3*emb_dim, 2*emb_dim);
     // RMSNorm q, k
     if (use_kqnorm){
         rmsnorm_group(c_query, c_query, c_rms_Wq, 1e-6, attn_heads, B, Tc, emb_dim);
@@ -1439,7 +1432,9 @@ void dit_block(
     if (use_dual_attention) scale_and_shift(x_hid, x_hid_dual, x_shift_scale_gate[6], x_shift_scale_gate[7], B, Tx, emb_dim);
     scale_and_shift(x_hid, x_hid, x_shift_scale_gate[0], x_shift_scale_gate[1], B, Tx, emb_dim);
     // Wqkv projections
-    to_qkv(x_hid, x_Wqkv, x_bias_qkv, x_query, x_key, x_value, B*Tx, emb_dim, emb_dim);
+    partial_linear(x_hid, x_Wqkv, x_bias_qkv, x_query, B*Tx, emb_dim, emb_dim, 3*emb_dim, 0*emb_dim);
+    partial_linear(x_hid, x_Wqkv, x_bias_qkv, x_key  , B*Tx, emb_dim, emb_dim, 3*emb_dim, 1*emb_dim);
+    partial_linear(x_hid, x_Wqkv, x_bias_qkv, x_value, B*Tx, emb_dim, emb_dim, 3*emb_dim, 2*emb_dim);
     // RMSNorm q, k
     if (use_kqnorm){
         rmsnorm_group(x_query, x_query, x_rms_Wq, 1e-6, attn_heads, B, Tx, emb_dim);
@@ -1449,7 +1444,7 @@ void dit_block(
     // ************************************* Attention ********************************************
     // concatenate context and latent to allow text-image tokens attend to each other
     concatenate_along_tokens(c_query, x_query, query, B, Tc, Tx, emb_dim);
-    concatenate_along_tokens(c_key, x_key, key, B, Tc, Tx, emb_dim);
+    concatenate_along_tokens(c_key  , x_key  , key  , B, Tc, Tx, emb_dim);
     concatenate_along_tokens(c_value, x_value, value, B, Tc, Tx, emb_dim);
     multihead_attention(query, key, value, query, B, attn_heads, T, T, head_dim); /*Output of self-attention is written back into query*/
     // Split the result back into context and latent
@@ -1462,10 +1457,12 @@ void dit_block(
     // ************************************* Dual Attention ********************************************
 
     if (use_dual_attention){
-        to_qkv(x_hid_dual, x_Wqkv_dual, x_bias_qkv_dual, x_query, x_key, x_value, B*Tx, emb_dim, emb_dim);
+        partial_linear(x_hid_dual, x_Wqkv_dual, x_bias_qkv_dual, x_query, B*Tx, emb_dim, emb_dim, 3*emb_dim, 0*emb_dim);
+        partial_linear(x_hid_dual, x_Wqkv_dual, x_bias_qkv_dual, x_key  , B*Tx, emb_dim, emb_dim, 3*emb_dim, 1*emb_dim);
+        partial_linear(x_hid_dual, x_Wqkv_dual, x_bias_qkv_dual, x_value, B*Tx, emb_dim, emb_dim, 3*emb_dim, 2*emb_dim);
         if (use_kqnorm){
             rmsnorm_group(x_query, x_query, x_rms_Wq_dual, 1e-6, attn_heads, B, Tx, emb_dim);
-            rmsnorm_group(x_key, x_key, x_rms_Wk_dual, 1e-6, attn_heads, B, Tx, emb_dim);
+            rmsnorm_group(x_key  , x_key  , x_rms_Wk_dual, 1e-6, attn_heads, B, Tx, emb_dim);
         }
         multihead_attention(x_query, x_key, x_value, x_query, B, attn_heads, Tx, Tx, head_dim);
         linear(x_query, x_Wout_dual, x_bias_out_dual, x_hid_dual, B*Tx, emb_dim, emb_dim);
