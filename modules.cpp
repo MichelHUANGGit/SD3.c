@@ -2,9 +2,11 @@
 #include <algorithm>
 #include <functional>
 #include <torch/extension.h>
-#include <stdexcept>
-#include <format>
-#include <type_traits>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+
+
 
 void layernorm(float* x, float* y, float* mean, float* rstd, float* w, float* bias, float eps, int B, int T, int C){
 
@@ -1015,7 +1017,7 @@ void crop_positional_embedding2D(float* pos_embed, float* new_pos_embed, int pos
 
 }
 
-torch::Tensor positional_embedding2D_tensor(int emb_dim, int height, int width, int base_size){
+torch::Tensor positional_embedding2D_forward(int emb_dim, int height, int width, int base_size){
 
     torch::Tensor positional_embedding = torch::empty({height * width, emb_dim});
     positional_embedding2D(positional_embedding.data_ptr<float>(), emb_dim, height, width, base_size);
@@ -1138,7 +1140,7 @@ void PatchEmbedding(float* latent_vector, float* patches, float* pos_embed_max, 
 }
 
 
-void mlp(float*x, float* output, float* W1, float* b1, float* h1, float* W2, float* b2, int B, int C_in, int C_hid, int C_out, 
+void mlp(float*x, float* output, float* h1, float* W1, float* b1, float* W2, float* b2, int B, int C_in, int C_hid, int C_out, 
     std::function<void (float*, float*, long long)> activation){
 
     // Linear -> activation -> Linear
@@ -1205,7 +1207,7 @@ torch::Tensor MLP(
     if (activation == "GELU" || activation == "gelu") act = gelu_tanh;
     else act = silu;
     float* h1 = new float[B * C_hid];
-    mlp(x, y, W1, b1, h1, W2, b2, B, C_in, C_hid, C_out, act);
+    mlp(x, y, h1, W1, b1, W2, b2, B, C_in, C_hid, C_out, act);
     delete[] h1;
 
     return output;
@@ -1251,19 +1253,6 @@ void gating_mechanism(float* input, float* output, float* gate, int B, int T, in
     }
 }
 
-
-void adaptative_layernorm_zero(
-    float* input, std::vector<float*> outputs, std::vector<float*> weights, std::vector<float*> biases, int B, int emb_dim){
-
-    for (size_t i=0; i<outputs.size(); i++){
-        // if nullptr, don't do operations (useful when switching from using/not using dual attention layers or when discarding context embeddings)
-        if (outputs[i] == nullptr || weights[i] == nullptr || biases[i] == nullptr){
-            std::cout << "Skipping ada linear_" << i << std::endl;
-            continue;
-        }
-        linear(input, weights[i], biases[i], outputs[i], B, emb_dim, emb_dim);
-    }
-}
 
 void concatenate_along_tokens(float* x, float* y, float* output, int B, int Tx, int Ty, int C){
     // Crap version of torch::cat((x, y), dim=1)
@@ -1370,13 +1359,13 @@ void dit_block(
     // Inputs, outputs written in-place
     float* y, float* c, float* x, 
     // Context parameters
-    std::vector<float*>& c_ada_lnorm_weights, std::vector<float*>& c_ada_lnorm_biases, /*Adaptative layer norm*/
+    float* c_ada_lnorm_weights, float* c_ada_lnorm_biases, /*Adaptative layer norm*/
     float* c_Wqkv, float* c_bias_qkv, /*Attention*/
     float* c_rms_Wq, float* c_rms_Wk, /*rms norm weight*/
     float* c_Wout, float* c_bias_out, /*Attention*/
     float* c_mlp_W1, float* c_mlp_b1, float* c_mlp_W2, float* c_mlp_b2, /*mlp*/
     // Latent parameters
-    std::vector<float*>& x_ada_lnorm_weights, std::vector<float*>& x_ada_lnorm_biases,
+    float* x_ada_lnorm_weights, float* x_ada_lnorm_biases,
     float* x_Wqkv, float* x_bias_qkv, 
     float* x_rms_Wq, float* x_rms_Wk,
     float* x_Wout, float* x_bias_out,
@@ -1389,10 +1378,9 @@ void dit_block(
     float* c_hid, float* x_hid, float* x_hid_dual,
     float* c_query, float* c_key, float* c_value, float* x_query, float* x_key, float* x_value, float* query, float* key, float* value,
     float* c_mlp_hidden, float* x_mlp_hidden,
-    std::vector<float*>& c_shift_scale_gate,
-    std::vector<float*>& x_shift_scale_gate,
+    float* y_hid1, float* y_hid2,
     // Others
-    int B, int Tc, int Tx, int emb_dim, int attn_heads, int mlp_expand, bool use_dual_attention, bool use_kqnorm, bool discard_context){
+    int B, int Tc, int Tx, int emb_dim, int attn_heads, int mlp_expand, bool use_dual_attention, bool use_qk_norm, bool discard_context){
     
     // ***************************************************** SETUP ***********************************************************
     // Tx = number of tokens in latent vector (the image)
@@ -1401,8 +1389,8 @@ void dit_block(
     // and x refers to the latent vector
     const int T = Tx + Tc;
     const int head_dim = emb_dim / attn_heads;
-    float* y_buffer1;
-    float* y_buffer2;
+    const int c_chunks = (discard_context) ? 2 : 6;
+    const int x_chunks = (use_dual_attention) ? 9 : 6;
 
     // ***************************************************** MAIN PART ***********************************************************
 
@@ -1411,32 +1399,43 @@ void dit_block(
     layernorm(c, c_hid, nullptr, nullptr, nullptr, nullptr, 1e-6, B, Tc, emb_dim);
 
     // c_hid = c_hid * (1.0 + scale_attn_context) + shift_attn_context
-    // partial_linear(y, )
-    adaptative_layernorm_zero(y, c_shift_scale_gate, c_ada_lnorm_weights, c_ada_lnorm_biases, B, emb_dim);
-    if (!discard_context) scale_and_shift(c_hid, c_hid, c_shift_scale_gate[0], c_shift_scale_gate[1], B, Tc, emb_dim);
-    else scale_and_shift(c_hid, c_hid, c_shift_scale_gate[1], c_shift_scale_gate[0], B, Tc, emb_dim);
+    partial_linear(y, c_ada_lnorm_weights, c_ada_lnorm_biases, y_hid1, B, emb_dim, emb_dim, c_chunks*emb_dim, 0*emb_dim);
+    partial_linear(y, c_ada_lnorm_weights, c_ada_lnorm_biases, y_hid2, B, emb_dim, emb_dim, c_chunks*emb_dim, 1*emb_dim);
+    float* c_shift = (discard_context) ? y_hid2 : y_hid1; /*This is not strictly necessary, we only swap these to mimic the huggingface implementation*/
+    float* c_scale = (discard_context) ? y_hid1 : y_hid2;
+    scale_and_shift(c_hid, c_hid, c_shift, c_scale, B, Tc, emb_dim);
+
     // Wqkv projections
     partial_linear(c_hid, c_Wqkv, c_bias_qkv, c_query, B*Tc, emb_dim, emb_dim, 3*emb_dim, 0*emb_dim);
     partial_linear(c_hid, c_Wqkv, c_bias_qkv, c_key  , B*Tc, emb_dim, emb_dim, 3*emb_dim, 1*emb_dim);
     partial_linear(c_hid, c_Wqkv, c_bias_qkv, c_value, B*Tc, emb_dim, emb_dim, 3*emb_dim, 2*emb_dim);
+
     // RMSNorm q, k
-    if (use_kqnorm){
+    if (use_qk_norm){
         rmsnorm_group(c_query, c_query, c_rms_Wq, 1e-6, attn_heads, B, Tc, emb_dim);
         rmsnorm_group(c_key, c_key, c_rms_Wk, 1e-6, attn_heads, B, Tc, emb_dim);
     }
 
     // *********************************** Pre-attention Latent **********************************
-    adaptative_layernorm_zero(y, x_shift_scale_gate, x_ada_lnorm_weights, x_ada_lnorm_biases, B, emb_dim);
     layernorm(x, x_hid, nullptr, nullptr, nullptr, nullptr, 1e-6, B, Tx, emb_dim);
-    // x_hid = x_hid * (1.0 + scale_attn_latent) + shift_attn_latent
-    if (use_dual_attention) scale_and_shift(x_hid, x_hid_dual, x_shift_scale_gate[6], x_shift_scale_gate[7], B, Tx, emb_dim);
-    scale_and_shift(x_hid, x_hid, x_shift_scale_gate[0], x_shift_scale_gate[1], B, Tx, emb_dim);
+
+    // Scale and shift
+    if (use_dual_attention){
+        partial_linear(y, x_ada_lnorm_weights, x_ada_lnorm_biases, y_hid1, B, emb_dim, emb_dim, x_chunks*emb_dim, 6*emb_dim);
+        partial_linear(y, x_ada_lnorm_weights, x_ada_lnorm_biases, y_hid2, B, emb_dim, emb_dim, x_chunks*emb_dim, 7*emb_dim);
+        scale_and_shift(x_hid, x_hid_dual, y_hid1, y_hid2, B, Tx, emb_dim);
+    }
+    partial_linear(y, x_ada_lnorm_weights, x_ada_lnorm_biases, y_hid1, B, emb_dim, emb_dim, x_chunks*emb_dim, 0*emb_dim);
+    partial_linear(y, x_ada_lnorm_weights, x_ada_lnorm_biases, y_hid2, B, emb_dim, emb_dim, x_chunks*emb_dim, 1*emb_dim);
+    scale_and_shift(x_hid, x_hid, y_hid1, y_hid2, B, Tx, emb_dim); /*in-place*/
+
     // Wqkv projections
     partial_linear(x_hid, x_Wqkv, x_bias_qkv, x_query, B*Tx, emb_dim, emb_dim, 3*emb_dim, 0*emb_dim);
     partial_linear(x_hid, x_Wqkv, x_bias_qkv, x_key  , B*Tx, emb_dim, emb_dim, 3*emb_dim, 1*emb_dim);
     partial_linear(x_hid, x_Wqkv, x_bias_qkv, x_value, B*Tx, emb_dim, emb_dim, 3*emb_dim, 2*emb_dim);
+
     // RMSNorm q, k
-    if (use_kqnorm){
+    if (use_qk_norm){
         rmsnorm_group(x_query, x_query, x_rms_Wq, 1e-6, attn_heads, B, Tx, emb_dim);
         rmsnorm_group(x_key, x_key, x_rms_Wk, 1e-6, attn_heads, B, Tx, emb_dim);
     }
@@ -1460,46 +1459,67 @@ void dit_block(
         partial_linear(x_hid_dual, x_Wqkv_dual, x_bias_qkv_dual, x_query, B*Tx, emb_dim, emb_dim, 3*emb_dim, 0*emb_dim);
         partial_linear(x_hid_dual, x_Wqkv_dual, x_bias_qkv_dual, x_key  , B*Tx, emb_dim, emb_dim, 3*emb_dim, 1*emb_dim);
         partial_linear(x_hid_dual, x_Wqkv_dual, x_bias_qkv_dual, x_value, B*Tx, emb_dim, emb_dim, 3*emb_dim, 2*emb_dim);
-        if (use_kqnorm){
+        if (use_qk_norm){
             rmsnorm_group(x_query, x_query, x_rms_Wq_dual, 1e-6, attn_heads, B, Tx, emb_dim);
             rmsnorm_group(x_key  , x_key  , x_rms_Wk_dual, 1e-6, attn_heads, B, Tx, emb_dim);
         }
         multihead_attention(x_query, x_key, x_value, x_query, B, attn_heads, Tx, Tx, head_dim);
         linear(x_query, x_Wout_dual, x_bias_out_dual, x_hid_dual, B*Tx, emb_dim, emb_dim);
-        gating_mechanism(x_hid_dual, x_hid_dual, x_shift_scale_gate[8], B, Tx, emb_dim);
+        // gating: x_hid_dual *= y_hid1[:, None, :]
+        partial_linear(y, x_ada_lnorm_weights, x_ada_lnorm_biases, y_hid1, B, emb_dim, emb_dim, x_chunks*emb_dim, 8*emb_dim);
+        gating_mechanism(x_hid_dual, x_hid_dual, y_hid1, B, Tx, emb_dim);
     }
 
 
     // *********************************** Context MLP **********************************
     if (!discard_context){
-        gating_mechanism(c_hid, c_hid, c_shift_scale_gate[2], B, Tc, emb_dim);
+        // Gating
+        partial_linear(y, c_ada_lnorm_weights, c_ada_lnorm_biases, y_hid1, B, emb_dim, emb_dim, c_chunks*emb_dim, 2*emb_dim);
+        gating_mechanism(c_hid, c_hid, y_hid1, B, Tc, emb_dim);
         // Skip connection: c = c + c_hid
         add(c_hid, c, c, B*Tc*emb_dim);
         layernorm(c, c_hid, nullptr, nullptr, nullptr, nullptr, 1e-6, B, Tc, emb_dim);
-        scale_and_shift(c_hid, c_hid, c_shift_scale_gate[3] , c_shift_scale_gate[4], B, Tc, emb_dim);
-        mlp(c_hid, c_hid,
-            c_mlp_W1, c_mlp_b1, c_mlp_hidden, c_mlp_W2, c_mlp_b2,
+        // Scale and shift
+        partial_linear(y, c_ada_lnorm_weights, c_ada_lnorm_biases, y_hid1, B, emb_dim, emb_dim, c_chunks*emb_dim, 3*emb_dim);
+        partial_linear(y, c_ada_lnorm_weights, c_ada_lnorm_biases, y_hid2, B, emb_dim, emb_dim, c_chunks*emb_dim, 4*emb_dim);
+        scale_and_shift(c_hid, c_hid, y_hid1, y_hid2, B, Tc, emb_dim);
+        // in-place MLP
+        mlp(c_hid, c_hid, c_mlp_hidden,
+            c_mlp_W1, c_mlp_b1, c_mlp_W2, c_mlp_b2,
             B*Tc, emb_dim, mlp_expand*emb_dim, emb_dim, gelu_tanh);
-        gating_mechanism(c_hid, c_hid, c_shift_scale_gate[5], B, Tc, emb_dim);
+        // Gating
+        partial_linear(y, c_ada_lnorm_weights, c_ada_lnorm_biases, y_hid1, B, emb_dim, emb_dim, c_chunks*emb_dim, 5*emb_dim);
+        gating_mechanism(c_hid, c_hid, y_hid1, B, Tc, emb_dim);
         // Skip connection: c = c + c_hid
         add(c_hid, c, c, B*Tc*emb_dim);
     }
 
     // *********************************** Latent MLP **********************************
-    gating_mechanism(x_hid, x_hid, x_shift_scale_gate[2], B, Tx, emb_dim);
+    // Gating
+    partial_linear(y, x_ada_lnorm_weights, x_ada_lnorm_biases, y_hid1, B, emb_dim, emb_dim, x_chunks*emb_dim, 2*emb_dim);
+    gating_mechanism(x_hid, x_hid, y_hid1, B, Tx, emb_dim);
+
     // Skip connection: x = x + x_hid + x_hid_dual
     add(x_hid, x, x, B*Tx*emb_dim);
     if (use_dual_attention) add(x_hid_dual, x, x, B*Tx*emb_dim);
+
     layernorm(x, x_hid, nullptr, nullptr, nullptr, nullptr, 1e-6, B, Tx, emb_dim);
-    scale_and_shift(x_hid, x_hid, x_shift_scale_gate[3], x_shift_scale_gate[4], B, Tx, emb_dim);
-    // x_query is re-used as a buffer storing the output of the mlp
-    mlp(x_hid, x_hid, 
-        x_mlp_W1, x_mlp_b1, x_mlp_hidden, x_mlp_W2, x_mlp_b2,
+
+    // Scale and shift
+    partial_linear(y, x_ada_lnorm_weights, x_ada_lnorm_biases, y_hid1, B, emb_dim, emb_dim, x_chunks*emb_dim, 3*emb_dim);
+    partial_linear(y, x_ada_lnorm_weights, x_ada_lnorm_biases, y_hid2, B, emb_dim, emb_dim, x_chunks*emb_dim, 4*emb_dim);
+    scale_and_shift(x_hid, x_hid, y_hid1, y_hid2, B, Tx, emb_dim);
+
+    // In-place MLP
+    mlp(x_hid, x_hid, x_mlp_hidden,
+        x_mlp_W1, x_mlp_b1, x_mlp_W2, x_mlp_b2,
         B*Tx, emb_dim, mlp_expand*emb_dim, emb_dim, gelu_tanh);
-    gating_mechanism(x_hid, x_hid, x_shift_scale_gate[5], B, Tx, emb_dim);
+
+    // Gating
+    partial_linear(y, x_ada_lnorm_weights, x_ada_lnorm_biases, y_hid1, B, emb_dim, emb_dim, x_chunks*emb_dim, 5*emb_dim);
+    gating_mechanism(x_hid, x_hid, y_hid1, B, Tx, emb_dim);
     // Skip connection: x = x + x_hid
     add(x_hid, x, x, B*Tx*emb_dim);
-
 }
 
 
@@ -1524,7 +1544,7 @@ std::vector<torch::Tensor> DiT_block_forward(
     // Latent mlp
     torch::Tensor& latent_mlp_weight1, torch::Tensor& latent_mlp_bias1, torch::Tensor& latent_mlp_weight2, torch::Tensor& latent_mlp_bias2,
     // Others
-    int B, int Tc, int Tx, int emb_dim, int attn_heads, int mlp_expand, bool use_dual_attention, bool use_kqnorm, bool discard_context){
+    int B, int Tc, int Tx, int emb_dim, int attn_heads, int mlp_expand, bool use_dual_attention, bool use_qk_norm, bool discard_context){
     
     // ***************************************************** SETUP ***********************************************************
     // In the following, c (lower-case) will always refer to the context embeddings
@@ -1537,46 +1557,6 @@ std::vector<torch::Tensor> DiT_block_forward(
 
     // Intermediate activation pointers
     float* x_hid_dual = use_dual_attention ? new float[B*Tx*emb_dim] : nullptr;
-    // Adaptative layer norm
-    std::vector<float*> c_shift_scale_gate;
-    std::vector<float*> x_shift_scale_gate;
-    std::vector<float*> c_ada_weights;
-    std::vector<float*> c_ada_biases;
-    std::vector<float*> x_ada_weights;
-    std::vector<float*> x_ada_biases;
-    for (int i=0; i<6; i++){
-        if (discard_context && i>=2){
-            c_shift_scale_gate.push_back(nullptr);
-            c_ada_weights.push_back(nullptr);
-            c_ada_biases.push_back(nullptr);
-        } else{
-            c_shift_scale_gate.push_back(new float[B*emb_dim]);
-            c_ada_weights.push_back(new float[emb_dim * emb_dim]);
-            c_ada_biases.push_back(new float[emb_dim]);
-        }
-        x_shift_scale_gate.push_back(new float[B*emb_dim]);
-        x_ada_weights.push_back(new float[emb_dim * emb_dim]);
-        x_ada_biases.push_back(new float[emb_dim]);
-    }
-    for (int i=0; i<3; i++){
-        if (use_dual_attention){
-            x_shift_scale_gate.push_back(new float[B*emb_dim]);
-            x_ada_weights.push_back(new float[emb_dim * emb_dim]);
-            x_ada_biases.push_back(new float[emb_dim]);
-        }
-        else {
-            x_shift_scale_gate.push_back(nullptr);
-            x_ada_weights.push_back(nullptr);
-            x_ada_biases.push_back(nullptr);
-        }
-    }
-
-    int context_splits = (discard_context) ? 2 : 6;
-    split_dim0(context_ada_linear_bias.data_ptr<float>(), c_ada_biases, context_splits, context_splits*emb_dim);
-    split_dim1(context_ada_linear_weight.data_ptr<float>(), c_ada_weights, context_splits, emb_dim, context_splits*emb_dim);
-    int latent_splits = (use_dual_attention) ? 9 : 6;
-    split_dim0(latent_ada_linear_bias.data_ptr<float>(), x_ada_biases, latent_splits, latent_splits*emb_dim);
-    split_dim1(latent_ada_linear_weight.data_ptr<float>(), x_ada_weights, latent_splits, emb_dim, latent_splits*emb_dim);
 
     // attention
     float* qc = new float[B*Tc*emb_dim];
@@ -1591,6 +1571,8 @@ std::vector<torch::Tensor> DiT_block_forward(
     // Others
     float* c_hid = new float[B*Tc*emb_dim];
     float* x_hid = new float[B*Tx*emb_dim];
+    float* y_hid1 = new float[B*emb_dim];
+    float* y_hid2 = new float[B*emb_dim];
     float* c_mlp_hidden = new float[B*Tc*4*emb_dim];
     float* x_mlp_hidden = new float[B*Tx*4*emb_dim];
 
@@ -1598,13 +1580,13 @@ std::vector<torch::Tensor> DiT_block_forward(
     dit_block(
         y, c, x,
         // Context
-        c_ada_weights, c_ada_biases,
+        context_ada_linear_weight.data_ptr<float>(), context_ada_linear_bias.data_ptr<float>(),
         context_Wqkv.data_ptr<float>(), context_bias_qkv.data_ptr<float>(),
         context_rmsnorm_Wq.data_ptr<float>(), context_rmsnorm_Wk.data_ptr<float>(),
         context_Wout.data_ptr<float>(), context_bias_out.data_ptr<float>(),
         context_mlp_weight1.data_ptr<float>(), context_mlp_bias1.data_ptr<float>(), context_mlp_weight2.data_ptr<float>(), context_mlp_bias2.data_ptr<float>(),
         // Latent
-        x_ada_weights, x_ada_biases,
+        latent_ada_linear_weight.data_ptr<float>(), latent_ada_linear_bias.data_ptr<float>(),
         latent_Wqkv.data_ptr<float>(), latent_bias_qkv.data_ptr<float>(), 
         latent_rmsnorm_Wq.data_ptr<float>(), latent_rmsnorm_Wk.data_ptr<float>(),
         latent_Wout.data_ptr<float>(), latent_bias_out.data_ptr<float>(),
@@ -1617,9 +1599,9 @@ std::vector<torch::Tensor> DiT_block_forward(
         c_hid, x_hid, x_hid_dual,
         qc, kc, vc, qx, kx, vx, Q, K, V,
         c_mlp_hidden, x_mlp_hidden,
-        c_shift_scale_gate, x_shift_scale_gate,
+        y_hid1, y_hid2,
         // Others
-        B, Tc, Tx, emb_dim, attn_heads, mlp_expand, use_dual_attention, use_kqnorm, discard_context
+        B, Tc, Tx, emb_dim, attn_heads, mlp_expand, use_dual_attention, use_qk_norm, discard_context
     );
 
     delete[] x_hid_dual;
@@ -1632,126 +1614,226 @@ std::vector<torch::Tensor> DiT_block_forward(
     delete[] Q;
     delete[] K;
     delete[] V;
-    for (auto& arr: c_ada_weights){
-        delete[] arr;
-    }
-    for (auto& arr: x_ada_weights){
-        delete[] arr;
-    }
-    for (auto& arr: c_ada_biases){
-        delete[] arr;
-    }
-    for (auto& arr: x_ada_biases){
-        delete[] arr;
-    }
-    for (auto& arr: c_shift_scale_gate){
-        delete[] arr;
-    }
-    for (auto& arr: x_shift_scale_gate){
-        delete[] arr;
-    }
+    delete[] x_hid;
+    delete[] c_hid;
+    delete[] y_hid1;
+    delete[] y_hid2;
+    delete[] x_mlp_hidden;
+    delete[] c_mlp_hidden;
     // return c, x
     return {context_embeddings, latent_vector};
 }
 
-
-std::vector<torch::Tensor> DiT_forward(
+torch::Tensor DiT_forward(
     // Inputs
     torch::Tensor& pooled_captions, torch::Tensor& captions, torch::Tensor& latent_vector, torch::Tensor& timesteps,
-    // ************ PARAMETERS *********** //
-    // One-time parameters:
-    torch::Tensor& time_mlp_weight1, torch::Tensor& time_mlp_bias1, torch::Tensor& time_mlp_weight2, torch::Tensor& time_mlp_bias2, 
-    torch::Tensor& pooled_mlp_weight1, torch::Tensor& pooled_mlp_bias1, torch::Tensor& pooled_mlp_weight2, torch::Tensor& pooled_mlp_bias2,
-    torch::Tensor& captions_linear_weight, torch::Tensor& captions_linear_bias,
-    torch::Tensor& latent_kernel_weight, torch::Tensor& latent_kernel_bias,
-    // !!! DiT-Block parameters !!!
-    // Context tensor parameters
-    torch::Tensor& context_ada_linear_weight, torch::Tensor& context_ada_linear_bias,
-    torch::Tensor& context_Wqkv, torch::Tensor& context_bias_qkv,
-    torch::Tensor& context_rmsnorm_Wq, torch::Tensor& context_rmsnorm_Wk,
-    torch::Tensor& context_Wout, torch::Tensor& context_bias_out,
-    torch::Tensor& context_mlp_weight1, torch::Tensor& context_mlp_bias1, torch::Tensor& context_mlp_weight2, torch::Tensor& context_mlp_bias2,
-    // Latent tensor parameters
-    torch::Tensor& latent_ada_linear_weight, torch::Tensor& latent_ada_linear_bias,
-    torch::Tensor& latent_Wqkv, torch::Tensor& latent_bias_qkv,
-    torch::Tensor& latent_rmsnorm_Wq, torch::Tensor& latent_rmsnorm_Wk,
-    torch::Tensor& latent_Wout, torch::Tensor& latent_bias_out,
-    // Dual latent tensor (if needed)
-    torch::Tensor& latent_Wqkv_dual, torch::Tensor& latent_bias_qkv_dual,
-    torch::Tensor& latent_rmsnorm_Wq_dual, torch::Tensor& latent_rmsnorm_Wk_dual,
-    torch::Tensor& latent_Wout_dual, torch::Tensor& latent_bias_out_dual,
-    // Latent mlp
-    torch::Tensor& latent_mlp_weight1, torch::Tensor& latent_mlp_bias1, torch::Tensor& latent_mlp_weight2, torch::Tensor& latent_mlp_bias2,
+    // ************ PARAMETERS passed in pytorch with dict(model.named_parameters())*********** //
+    std::unordered_map<std::string, torch::Tensor>& params,
     // Others
-    int num_layers, int pooled_dim, int captions_dim, int latent_in_channels, int emb_dim, int attn_heads, int mlp_expand,
-    int patch_size, int pos_embed_max_size, int base_height, bool use_dual_attention, bool use_kqnorm, bool discard_context){
+    int num_layers, std::unordered_set<int> dual_attention_layers, 
+    int pooled_dim, int captions_dim, int C_in, int emb_dim, int attn_heads, int mlp_expand,
+    int patch_size, int pos_embed_max_size, int base_height, bool use_qk_norm){
     
     // ***************************************************** SETUP ***********************************************************
     int B = latent_vector.size(0);
     int Tc = captions.size(1);
     int H = latent_vector.size(2);
     int W = latent_vector.size(3);
-    std::pair<int, int> hw = get_conv2d_output_size(H, W, patch_size, patch_size, patch_size, 0);
-    int h = hw.first, w = hw.second;
-    int Tx = h * w;
+    std::pair<int, int> HW_ = get_conv2d_output_size(H, W, patch_size, patch_size, patch_size, 0);
+    int H_ = HW_.first, W_ = HW_.second;
+    int Tx = H_ * W_;
 
-    torch::Tensor latent_out = torch::empty_like(latent_vector);
-    torch::Tensor toto = torch::empty({B, Tx, emb_dim});
+    // utility function to retrieve the data ptr of a parameter by its name. If the name doesn't exist, returns nullptr
+    auto get_ptr = [&params](const std::string& param_name) -> float* {
+        if (params.count(param_name) > 0) {
+            return params[param_name].data_ptr<float>();
+        }
+        // std::cout << "Skipping missing param: " << param_name << std::endl;
+        return nullptr;
+    };
 
+    torch::Tensor x_out = torch::empty_like(latent_vector); /*(B, C_in, H, W)*/
 
-    float* y_hidden = new float[B*emb_dim];
     float* pooled = new float[B*emb_dim];
-    float* y = new float[B*emb_dim];
     float* pos_embed_max = new float[pos_embed_max_size * pos_embed_max_size * emb_dim];
-    float* pos_embed = new float[h * w * emb_dim];
+    float* pos_embed = new float[H_ * W_ * emb_dim];
+    float* y = new float[B*emb_dim];
+    float* y_hid = new float[B*emb_dim];
+    float* y_hid2 = new float[B*emb_dim];
     float* x = new float[B*Tx*emb_dim];
     float* x_hid = new float[B*Tx*emb_dim];
+    float* x_hid_dual = new float[B*Tx*emb_dim];
     float* c = new float[B*Tc*emb_dim];
     float* c_hid = new float[B*Tc*emb_dim];
+    // attention hidden activaitons
+    float* c_query = new float[B*Tc*emb_dim];
+    float* c_key = new float[B*Tc*emb_dim];
+    float* c_value = new float[B*Tc*emb_dim];
+    float* x_query = new float[B*Tx*emb_dim];
+    float* x_key = new float[B*Tx*emb_dim];
+    float* x_value = new float[B*Tx*emb_dim];
+    float* query = new float[B*(Tc+Tx)*emb_dim];
+    float* key = new float[B*(Tc+Tx)*emb_dim];
+    float* value = new float[B*(Tc+Tx)*emb_dim];
+    // mlp hidden
+    float* c_mlp_hid = new float[B*Tc*mlp_expand*emb_dim];
+    float* x_mlp_hid = new float[B*Tx*mlp_expand*emb_dim];
 
     // ***************************************************** MAIN ***********************************************************
+
     // pooled captions + timesteps -> y
     torch::Tensor timesteps_embeddings = sinusoidal_embedding(timesteps, 256);
-    mlp(timesteps_embeddings.data_ptr<float>(), y, 
-        time_mlp_weight1.data_ptr<float>(), time_mlp_bias1.data_ptr<float>(), y_hidden, time_mlp_weight2.data_ptr<float>(), time_mlp_bias2.data_ptr<float>(),
+    mlp(timesteps_embeddings.data_ptr<float>(), y,  y_hid,
+        get_ptr("timestep_mlp.0.weight"), get_ptr("timestep_mlp.0.bias"), 
+        get_ptr("timestep_mlp.2.weight"), get_ptr("timestep_mlp.2.bias"),
         B, 256, emb_dim, emb_dim, silu);
-    mlp(pooled_captions.data_ptr<float>(), pooled, 
-        pooled_mlp_weight1.data_ptr<float>(), pooled_mlp_bias1.data_ptr<float>(), y_hidden, pooled_mlp_weight2.data_ptr<float>(), pooled_mlp_bias2.data_ptr<float>(),
+    mlp(pooled_captions.data_ptr<float>(), pooled, y_hid,
+        get_ptr("pooled_mlp.0.weight"), get_ptr("pooled_mlp.0.bias"),
+        get_ptr("pooled_mlp.2.weight"), get_ptr("pooled_mlp.2.bias"),
         B, pooled_dim, emb_dim, emb_dim, silu);
+
     /*y = silu(y+pooled)*/
     add(y, pooled, y, B*emb_dim); 
     silu(y, y, B*emb_dim);
 
     // captions -> c
-    linear(captions.data_ptr<float>(), captions_linear_weight.data_ptr<float>(), captions_linear_bias.data_ptr<float>(), c, B*Tc, captions_dim, emb_dim);
+    linear(captions.data_ptr<float>(), get_ptr("captions_linear.weight"), get_ptr("captions_linear.bias"), c, B*Tc, captions_dim, emb_dim);
 
     // noisy latent (B,C,H,W) -> x (B, Tx, emb_dim)
     // result is written into x, x_hid is used as a temporary buffer
     PatchEmbedding(latent_vector.data_ptr<float>(), x_hid, pos_embed_max, pos_embed, x, 
-            latent_kernel_weight.data_ptr<float>(), latent_kernel_bias.data_ptr<float>(), 
-            B, H, W, latent_in_channels, emb_dim, patch_size, pos_embed_max_size, base_height);
+            get_ptr("to_patch.conv.weight"), get_ptr("to_patch.conv.bias"),
+            B, H, W, C_in, emb_dim, patch_size, pos_embed_max_size, base_height);
+    
+    // DiT Blocks
+    for (int l=0; l<num_layers; l++){
+        std::string prefix = "transformer." + std::to_string(l) + "."; /*e.g. prefix="transformer.0." for the 1st DiT block*/
+        bool use_dual_attention = (dual_attention_layers.count(l) > 0);
+        bool discard_context = (l == num_layers-1);
 
-    // for (int l=0; l<num_layers; l++){
-    //     dit_block(y, c, x);
-    // }
+        // write results in-place in c, x
+        dit_block(
+            y, c, x,
+            // Context parameters
+            get_ptr(prefix+"context_ada_lnorm.linear.weight"), get_ptr(prefix+"context_ada_lnorm.linear.bias"),
+            get_ptr(prefix+"context_to_qkv.weight"), get_ptr(prefix+"context_to_qkv.bias"),
+            get_ptr(prefix+"context_rmsnorm_query.weight"), get_ptr(prefix+"context_rmsnorm_key.weight"),
+            get_ptr(prefix+"context_attn_Wout.weight"), get_ptr(prefix+"context_attn_Wout.bias"),
+            get_ptr(prefix+"context_mlp.lin1.weight"), get_ptr(prefix+"context_mlp.lin1.bias"),
+            get_ptr(prefix+"context_mlp.lin2.weight"), get_ptr(prefix+"context_mlp.lin2.bias"),
+            // Latent parameters
+            get_ptr(prefix+"latent_ada_lnorm.linear.weight"), get_ptr(prefix+"latent_ada_lnorm.linear.bias"),
+            get_ptr(prefix+"latent_to_qkv.weight"), get_ptr(prefix+"latent_to_qkv.bias"),
+            get_ptr(prefix+"latent_rmsnorm_query.weight"), get_ptr(prefix+"latent_rmsnorm_key.weight"),
+            get_ptr(prefix+"latent_attn_Wout.weight"), get_ptr(prefix+"latent_attn_Wout.bias"),
+            // Dual latent parameters
+            get_ptr(prefix+"latent_dual_to_qkv.weight"), get_ptr(prefix+"latent_dual_to_qkv.bias"),
+            get_ptr(prefix+"latent_dual_rmsnorm_query.weight"), get_ptr(prefix+"latent_dual_rmsnorm_key.weight"),
+            get_ptr(prefix+"latent_dual_attn_Wout.weight"), get_ptr(prefix+"latent_dual_attn_Wout.bias"),
+            // Latent MLP
+            get_ptr(prefix+"latent_mlp.lin1.weight"), get_ptr(prefix+"latent_mlp.lin1.bias"),
+            get_ptr(prefix+"latent_mlp.lin2.weight"), get_ptr(prefix+"latent_mlp.lin2.bias"),
+            // Intermediate hidden activations
+            c_hid, x_hid, x_hid_dual, c_query, c_key, c_value, x_query, x_key, x_value, query, key, value, c_mlp_hid, x_mlp_hid, y_hid, y_hid2,
+            B, Tc, Tx, emb_dim, attn_heads, mlp_expand, use_dual_attention, use_qk_norm, discard_context
+        );
+    }
+
+    // Final output
+    layernorm(x, x_hid, nullptr, nullptr, nullptr, nullptr, 1e-5f, B, Tx, emb_dim);
+    // Scale and shift
+    partial_linear(y, get_ptr("ada_ln_out.linear.weight"), get_ptr("ada_ln_out.linear.bias"), y_hid , B, emb_dim, emb_dim, 2*emb_dim, 0*emb_dim);
+    partial_linear(y, get_ptr("ada_ln_out.linear.weight"), get_ptr("ada_ln_out.linear.bias"), y_hid2, B, emb_dim, emb_dim, 2*emb_dim, 1*emb_dim);
+    scale_and_shift(x_hid, x_hid, y_hid2, y_hid, B, Tx, emb_dim);
+    // linear written into x, (B, Tx, emb_dim) -> (B, Tx, temp:= patch * patch * C_in)
+    int temp = patch_size * patch_size * C_in;
+    linear(x_hid, get_ptr("linear_out.weight"), get_ptr("linear_out.bias"), x, B*Tx, emb_dim, temp);
+
+    // Rearrange x (B, Tx, patch * patch * C_in) -> (B, C_in, H, W) where Tx = H_*W_, H = H_*patch, W = W_*patch
+    float* x_out_ = x_out.data_ptr<float>();
+    for (int b=0; b<B; b++){
+        for (int c=0; c<C_in; c++){
+            float* x_out_bc = x_out_ + b * C_in * H * W + c * H * W;
+            for (int h_=0; h_<H_; h_++){
+                for (int w_=0; w_<W_; w_++){
+                    for (int ph=0; ph<patch_size; ph++){
+                        for (int pw=0; pw<patch_size; pw++){
+                            // x_out[b, c, h_*patch + ph, w_*patch + pw] = x[b, h_*W_+w_, ph * patch_size * C_in + pw * C_in + c]
+                            x_out_bc[(h_*patch_size + ph) * W + w_*patch_size + pw] = 
+                                x[b * Tx * temp + (h_ * W_ + w_) * temp + ph * patch_size * C_in + pw * C_in + c];
+                        }
+                    }
+                }
+            }
+        }
+    }
 
 
-    delete[] y_hidden;
-    delete[] x_hid;
-    delete[] c_hid;
+    // Free memory
+    delete[] pooled;
     delete[] pos_embed_max;
     delete[] pos_embed;
-    delete[] pooled;
+    delete[] y;
+    delete[] y_hid;
+    delete[] y_hid2;
+    delete[] x;
+    delete[] x_hid;
+    delete[] x_hid_dual;
+    delete[] c;
+    delete[] c_hid;
+    delete[] c_query;
+    delete[] c_key;
+    delete[] c_value;
+    delete[] x_query;
+    delete[] x_key;
+    delete[] x_value;
+    delete[] query;
+    delete[] key;
+    delete[] value;
+    delete[] c_mlp_hid;
+    delete[] x_mlp_hid;
 
-    return {toto};
+    return x_out;
 }
 
-void temp(std::vector<int> l){
-    for (size_t i=0; i<l.size(); i++){
-        std::cout << l[i] << std::endl;  
-    }
+torch::Tensor temp(std::unordered_map<std::string, torch::Tensor>& params){
+    torch::Tensor W1 = params["timestep_mlp.0.weight"];
+    torch::Tensor b1 = params["timestep_mlp.0.bias"];
+    torch::Tensor W2 = params["timestep_mlp.2.weight"];
+    torch::Tensor b2 = params["timestep_mlp.2.bias"];
+    torch::Tensor y = torch::randn({2,256});
+    float* x = new float[2*256];
+    float* hid = new float[2*256];
+    std::cout << "Performing mlp" << std::endl;
+    mlp(x, y.data_ptr<float>(), hid, 
+        W1.data_ptr<float>(), b1.data_ptr<float>(), W2.data_ptr<float>(), b2.data_ptr<float>(),
+        2, 256, 256, 256, silu
+    );
+    return y;
 }
 
+torch::Tensor temp2(std::unordered_map<std::string, torch::Tensor>& params){
+    int B = 2;
+    int emb_dim = 256;
+    
+    torch::Tensor y = torch::randn({B, emb_dim});
+    float* x = new float[B*emb_dim];
+    float* hid = new float[B*emb_dim];
+
+    torch::Tensor W1 = params["timestep_mlp.0.weight"];
+    torch::Tensor b1 = params["timestep_mlp.0.bias"];
+    torch::Tensor W2 = params["timestep_mlp.2.weight"];
+    torch::Tensor b2 = params["timestep_mlp.2.bias"];
+
+    std::cout << "Performing mlp" << std::endl;
+    mlp(x, y.data_ptr<float>(),  hid,
+        W1.data_ptr<float>(), b1.data_ptr<float>(), 
+        W2.data_ptr<float>(), b2.data_ptr<float>(),
+        B, 256, emb_dim, emb_dim, silu);
+    
+    // delete[] hid;
+    // delete[] x;
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
     m.def("layer_norm", &LayerNorm_forward, "LayerNorm forward");
@@ -1769,11 +1851,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
     m.def("linear_backward", &Linear_backward, "Linear backward");
     m.def("conv2d", &conv2d_forward, "Conv2d forward");
     m.def("sinusoidal_embedding", &sinusoidal_embedding, "Temporal sinusoidal embeddings");
-    m.def("positional_embedding", &positional_embedding2D_tensor, "2D positional embeddings");
+    m.def("positional_embedding", &positional_embedding2D_forward, "2D positional embeddings");
     m.def("scaled_dot_product_attention", &scaled_dot_product_attention, "single-head self attention");
     m.def("mha", &mha, "multi-head self attention");
     m.def("mlp", &MLP, "MLP");
     m.def("Dit_block", &DiT_block_forward, "Stable diffusion's DiT block");
     m.def("DiT", &DiT_forward, "SD3.5 medium");
     m.def("test", &temp, "");
+    m.def("test2", &temp2, "");
 }

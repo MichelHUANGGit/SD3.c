@@ -30,7 +30,7 @@ class PatchEmbedding(nn.Module):
         self.use_positional_embeddings = use_positional_embeddings
         self.base_size = base_height // patch_size
 
-        self.to_patch = nn.Conv2d(in_channels, out_channels, kernel_size=(patch_size, patch_size), stride=(patch_size, patch_size))
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=(patch_size, patch_size), stride=(patch_size, patch_size))
         if use_layer_norm:
             self.lnorm = nn.LayerNorm(out_channels, eps=1e-6, elementwise_affine=False)
         if use_positional_embeddings:
@@ -56,7 +56,7 @@ class PatchEmbedding(nn.Module):
     def forward(self, x:Tensor) -> Tensor:
         """x (B,C,H,W): noised latent"""
         
-        patches = self.to_patch(x)
+        patches = self.conv(x)
         B,E,h,w = patches.shape
         patches = patches.flatten(2).transpose(1,2) # (B,T,E) where T=h*w, E=emb_dim, h,w = height, width in patches (not pixels) resolution
         if self.use_layer_norm:
@@ -205,7 +205,7 @@ class RMSNorm(nn.Module):
 class MM_DiT_Block(nn.Module):
     """https://huggingface.co/stabilityai/stable-diffusion-3.5-medium/blob/main/mmdit-x.png"""
     
-    def __init__(self, emb_dim, attn_heads, mlp_expand, discard_context=False, use_dual_attention=True, use_kq_norm=True, *args, **kwargs):
+    def __init__(self, emb_dim, attn_heads, mlp_expand, discard_context=False, use_dual_attention=True, use_qk_norm=True, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.emb_dim = emb_dim
@@ -215,13 +215,13 @@ class MM_DiT_Block(nn.Module):
         self.mlp_expand = mlp_expand
         self.discard_context = discard_context # whether or not to discard the context embeddings after the attention module, True for the last block
         self.use_dual_attention = use_dual_attention
-        self.use_kq_norm = use_kq_norm
+        self.use_qk_norm = use_qk_norm
 
         # Context layers
         self.context_lnorm1 = nn.LayerNorm(emb_dim, eps=1e-6, elementwise_affine=False)
         self.context_ada_lnorm = AdaLN_Zero(emb_dim, chunks=6                           if not(discard_context) else 2)
-        self.context_to_kqv = nn.Linear(emb_dim, 3*emb_dim)
-        if use_kq_norm:
+        self.context_to_qkv = nn.Linear(emb_dim, 3*emb_dim)
+        if use_qk_norm:
             self.context_rmsnorm_key = RMSNorm(self.head_dim, eps=1e-6)
             self.context_rmsnorm_query = RMSNorm(self.head_dim, eps=1e-6)
         self.context_attn_Wout = nn.Linear(emb_dim, emb_dim)                            if not(discard_context) else nn.Identity()
@@ -231,8 +231,8 @@ class MM_DiT_Block(nn.Module):
         # latent vector layers
         self.latent_lnorm1 = nn.LayerNorm(emb_dim, eps=1e-6, elementwise_affine=False)
         self.latent_ada_lnorm = AdaLN_Zero(emb_dim, chunks=9 if use_dual_attention else 6) 
-        self.latent_to_kqv = nn.Linear(emb_dim, 3*emb_dim)
-        if use_kq_norm:
+        self.latent_to_qkv = nn.Linear(emb_dim, 3*emb_dim)
+        if use_qk_norm:
             self.latent_rmsnorm_key = RMSNorm(self.head_dim, eps=1e-6)
             self.latent_rmsnorm_query = RMSNorm(self.head_dim, eps=1e-6)
         self.latent_attn_Wout = nn.Linear(emb_dim, emb_dim)
@@ -241,11 +241,11 @@ class MM_DiT_Block(nn.Module):
 
         # if dual, extra latent layers
         if use_dual_attention:
-            self.latent_to_kqv_x2 = nn.Linear(emb_dim, 3*emb_dim)
-            if use_kq_norm:
-                self.latent_rmsnorm_key_x2 = RMSNorm(self.head_dim, eps=1e-6)
-                self.latent_rmsnorm_query_x2 = RMSNorm(self.head_dim, eps=1e-6)
-            self.latent_attn_Wout_x2 = nn.Linear(emb_dim, emb_dim)
+            self.latent_dual_to_qkv = nn.Linear(emb_dim, 3*emb_dim)
+            if use_qk_norm:
+                self.latent_dual_rmsnorm_key = RMSNorm(self.head_dim, eps=1e-6)
+                self.latent_dual_rmsnorm_query = RMSNorm(self.head_dim, eps=1e-6)
+            self.latent_dual_attn_Wout = nn.Linear(emb_dim, emb_dim)
         
         self.B_id = 0
         self.T_id = 1
@@ -269,8 +269,7 @@ class MM_DiT_Block(nn.Module):
 
         c_out = self.context_lnorm1(c) # (B,77+77,C)
         c_out = (1.0 + scale_attn_c) * c_out + shift_attn_c # scale, shift
-        qc, kc, vc = self.context_to_kqv(c_out).chunk(3, dim=-1)
-        self.register_buffer("tempc", qc)
+        qc, kc, vc = self.context_to_qkv(c_out).chunk(3, dim=-1)
         qc = qc.view(B, Tc, self.attn_heads, C//self.attn_heads)
         kc = kc.view(B, Tc, self.attn_heads, C//self.attn_heads)
         vc = vc.view(B, Tc, self.attn_heads, C//self.attn_heads)
@@ -285,13 +284,13 @@ class MM_DiT_Block(nn.Module):
 
         # x1
         x1 = (1.0 + scale_attn_x1) * x_out + shift_attn_x1 # scale, shift
-        qx, kx, vx = self.latent_to_kqv(x1).chunk(3, dim=-1)
+        qx, kx, vx = self.latent_to_qkv(x1).chunk(3, dim=-1)
         qx = qx.view(B, Tx, self.attn_heads, C//self.attn_heads)
         kx = kx.view(B, Tx, self.attn_heads, C//self.attn_heads)
         vx = vx.view(B, Tx, self.attn_heads, C//self.attn_heads)
 
         # Optional rmsnorm along head_dim (last axis)
-        if self.use_kq_norm:
+        if self.use_qk_norm:
             kc = self.context_rmsnorm_key(kc)
             qc = self.context_rmsnorm_query(qc)
             kx = self.latent_rmsnorm_key(kx)
@@ -320,17 +319,17 @@ class MM_DiT_Block(nn.Module):
 
         if self.use_dual_attention:
             x2 = (1.0 + scale_attn_x2) * x_out + shift_attn_x2
-            qx2, kx2, vx2 = self.latent_to_kqv_x2(x2).chunk(3, dim=-1)
+            qx2, kx2, vx2 = self.latent_dual_to_qkv(x2).chunk(3, dim=-1)
             qx2 = qx2.view(B, Tx, self.attn_heads, C//self.attn_heads).transpose(1,2)
             kx2 = kx2.view(B, Tx, self.attn_heads, C//self.attn_heads).transpose(1,2)
             vx2 = vx2.view(B, Tx, self.attn_heads, C//self.attn_heads).transpose(1,2)
-            if self.use_kq_norm:
-                qx2 = self.latent_rmsnorm_query_x2(qx2)
-                kx2 = self.latent_rmsnorm_key_x2(kx2)
+            if self.use_qk_norm:
+                qx2 = self.latent_dual_rmsnorm_query(qx2)
+                kx2 = self.latent_dual_rmsnorm_key(kx2)
 
             attn_output_x2 = F.scaled_dot_product_attention(qx2, kx2, vx2) # self attention image
             attn_output_x2 = attn_output_x2.transpose(1,2).flatten(2, -1) # (B,Tx,C)
-            attn_output_x2 = self.latent_attn_Wout_x2(attn_output_x2)
+            attn_output_x2 = self.latent_dual_attn_Wout(attn_output_x2)
             attn_output_x2 = attn_output_x2 * gate_attn_x2
             x = x + attn_output_x2 # residual
         
@@ -358,7 +357,7 @@ class MM_DiT_Block(nn.Module):
 class MMDiT(nn.Module):
     """Architecture: https://huggingface.co/stabilityai/stable-diffusion-3.5-medium/blob/main/mmdit-x.png"""
 
-    def __init__(self, num_layers, dual_attention_layers, in_dim, emb_dim, pooled_dim, captions_dim, patch_size, attn_heads, mlp_expand, pos_embed_max_size, base_height, use_kq_norm=True):
+    def __init__(self, num_layers, dual_attention_layers, in_dim, emb_dim, pooled_dim, captions_dim, patch_size, attn_heads, mlp_expand, pos_embed_max_size, base_height, use_qk_norm=True):
         super().__init__()
         self.num_layers = num_layers
         self.dual_attention_layers = dual_attention_layers
@@ -369,27 +368,27 @@ class MMDiT(nn.Module):
         self.patch_size = patch_size
         self.attn_heads = attn_heads
         self.mlp_expand = mlp_expand
-        self.use_kq_norm = use_kq_norm
+        self.use_qk_norm = use_qk_norm
 
         self.timestep_mlp = nn.Sequential(
             nn.Linear(256, emb_dim),
             nn.SiLU(),
             nn.Linear(emb_dim, emb_dim)
         )
-        self.pooled_text_mlp = nn.Sequential(
+        self.pooled_mlp = nn.Sequential(
             nn.Linear(pooled_dim, emb_dim),
             nn.SiLU(),
             nn.Linear(emb_dim, emb_dim)
         )
-        self.context_linear = nn.Linear(captions_dim, emb_dim)
-        self.to_patches = PatchEmbedding(in_dim, emb_dim, base_height, patch_size, pos_embed_max_size, use_positional_embeddings=True)
+        self.captions_linear = nn.Linear(captions_dim, emb_dim)
+        self.to_patch = PatchEmbedding(in_dim, emb_dim, base_height, patch_size, pos_embed_max_size, use_positional_embeddings=True)
 
         self.transformer = nn.ModuleList([
-            MM_DiT_Block(emb_dim, attn_heads, mlp_expand, discard_context=False, use_dual_attention=(layer_id in dual_attention_layers), use_kq_norm=use_kq_norm)
+            MM_DiT_Block(emb_dim, attn_heads, mlp_expand, discard_context=False, use_dual_attention=(layer_id in dual_attention_layers), use_qk_norm=use_qk_norm)
             for layer_id in range(num_layers-1)
         ])
         # last DiT block discards context embeddings mid way (after the attention)
-        self.transformer.append(MM_DiT_Block(emb_dim, attn_heads, mlp_expand, discard_context=True, use_dual_attention=False, use_kq_norm=use_kq_norm))
+        self.transformer.append(MM_DiT_Block(emb_dim, attn_heads, mlp_expand, discard_context=True, use_dual_attention=False, use_qk_norm=use_qk_norm))
 
         self.lnorm_out = nn.LayerNorm(emb_dim, elementwise_affine=False, bias=False, eps=1e-5)
         self.ada_ln_out = AdaLN_Zero(emb_dim, chunks=2)
@@ -403,13 +402,11 @@ class MMDiT(nn.Module):
 
         timesteps_embeddings = get_sinusoidal_embedding(timesteps, emb_dim=256)
         timesteps_embeddings = self.timestep_mlp(timesteps_embeddings)
-        pooled_text = self.pooled_text_mlp(pooled_captions)
+        pooled_text = self.pooled_mlp(pooled_captions)
 
         y = F.silu(timesteps_embeddings + pooled_text)
-        c = self.context_linear(coarse_captions)
-        x = self.to_patches(noisy_latent)
-
-        self.register_buffer("x", x)
+        c = self.captions_linear(coarse_captions)
+        x = self.to_patch(noisy_latent)
 
         for block in self.transformer:
             c, x = block(x, c, y)
@@ -422,7 +419,7 @@ class MMDiT(nn.Module):
         # patch to pixels
         height_p, width_p = height//self.patch_size, width//self.patch_size # resolution in patches
         x_out = x_out.view(batch_size, height_p, width_p, self.patch_size, self.patch_size, in_dim)
-        x_out = pt.einsum("bhwpqc->bchpwq", x_out) # (B, in_dim, height_p, patch_size, width_p, patch_size)
+        x_out = pt.einsum("bhwpqc->bchpwq", x_out) # -> (B, in_dim, height_p, patch_size, width_p, patch_size)
         x_out = x_out.flatten(2,3).flatten(3,4) # flatten height with patch dimension, and width with patch dimension
 
         return x_out
@@ -521,7 +518,7 @@ if __name__ == "__main__":
         attn_heads=attn_heads,
         pooled_dim=pooled_dim,
         captions_dim=captions_dim,
-        use_kq_norm=False,
+        use_qk_norm=False,
         dual_attention_layers=dual_attention_layers,
         patch_size=patch_size,
         base_height=H,
@@ -534,8 +531,8 @@ if __name__ == "__main__":
 
     # (NOTHING INTERESTING HERE) Copying exact weights for comparison (NOTHING INTERESTING HERE) (NOTHING INTERESTING HERE)
     # to patch
-    SD3.pos_embed.proj.weight.data = model.to_patches.to_patch.weight.data.clone()
-    SD3.pos_embed.proj.bias.data = model.to_patches.to_patch.bias.data.clone()
+    SD3.pos_embed.proj.weight.data = model.to_patch.conv.weight.data.clone()
+    SD3.pos_embed.proj.bias.data = model.to_patch.conv.bias.data.clone()
 
     # timestep embedding
     SD3.time_text_embed.timestep_embedder.linear_1.weight.data = model.timestep_mlp[0].weight.data.clone()
@@ -544,14 +541,14 @@ if __name__ == "__main__":
     SD3.time_text_embed.timestep_embedder.linear_2.bias.data = model.timestep_mlp[2].bias.data.clone()
 
     # pooled captions
-    SD3.time_text_embed.text_embedder.linear_1.weight.data = model.pooled_text_mlp[0].weight.data.clone()
-    SD3.time_text_embed.text_embedder.linear_1.bias.data = model.pooled_text_mlp[0].bias.data.clone()
-    SD3.time_text_embed.text_embedder.linear_2.weight.data = model.pooled_text_mlp[2].weight.data.clone()
-    SD3.time_text_embed.text_embedder.linear_2.bias.data = model.pooled_text_mlp[2].bias.data.clone()
+    SD3.time_text_embed.text_embedder.linear_1.weight.data = model.pooled_mlp[0].weight.data.clone()
+    SD3.time_text_embed.text_embedder.linear_1.bias.data = model.pooled_mlp[0].bias.data.clone()
+    SD3.time_text_embed.text_embedder.linear_2.weight.data = model.pooled_mlp[2].weight.data.clone()
+    SD3.time_text_embed.text_embedder.linear_2.bias.data = model.pooled_mlp[2].bias.data.clone()
 
-    # coarse-grained captions (a.k.a. context or 'c')
-    SD3.context_embedder.weight.data = model.context_linear.weight.data.clone()
-    SD3.context_embedder.bias.data = model.context_linear.bias.data.clone()
+    # captions (a.k.a. context or 'c')
+    SD3.context_embedder.weight.data = model.captions_linear.weight.data.clone()
+    SD3.context_embedder.bias.data = model.captions_linear.bias.data.clone()
 
     # DiT blocks
     for i in range(num_layers):
@@ -566,36 +563,36 @@ if __name__ == "__main__":
 
 
         # Wkqv, Wo latent vector x1
-        dit_block_SD3.attn.to_q.weight.data = dit_block_imp.latent_to_kqv.weight.data[:C,:].clone()
-        dit_block_SD3.attn.to_q.bias.data = dit_block_imp.latent_to_kqv.bias.data[:C].clone()
-        dit_block_SD3.attn.to_k.weight.data = dit_block_imp.latent_to_kqv.weight.data[C:2*C,:].clone()
-        dit_block_SD3.attn.to_k.bias.data = dit_block_imp.latent_to_kqv.bias.data[C:2*C].clone()
-        dit_block_SD3.attn.to_v.weight.data = dit_block_imp.latent_to_kqv.weight.data[2*C:,:].clone()
-        dit_block_SD3.attn.to_v.bias.data = dit_block_imp.latent_to_kqv.bias.data[2*C:].clone()
+        dit_block_SD3.attn.to_q.weight.data = dit_block_imp.latent_to_qkv.weight.data[:C,:].clone()
+        dit_block_SD3.attn.to_q.bias.data = dit_block_imp.latent_to_qkv.bias.data[:C].clone()
+        dit_block_SD3.attn.to_k.weight.data = dit_block_imp.latent_to_qkv.weight.data[C:2*C,:].clone()
+        dit_block_SD3.attn.to_k.bias.data = dit_block_imp.latent_to_qkv.bias.data[C:2*C].clone()
+        dit_block_SD3.attn.to_v.weight.data = dit_block_imp.latent_to_qkv.weight.data[2*C:,:].clone()
+        dit_block_SD3.attn.to_v.bias.data = dit_block_imp.latent_to_qkv.bias.data[2*C:].clone()
         dit_block_SD3.attn.to_out[0].weight.data = dit_block_imp.latent_attn_Wout.weight.data.clone()
         dit_block_SD3.attn.to_out[0].bias.data = dit_block_imp.latent_attn_Wout.bias.data.clone()
 
         # Wkqv, Wo context
-        dit_block_SD3.attn.add_q_proj.weight.data = dit_block_imp.context_to_kqv.weight.data[:C,:].clone()
-        dit_block_SD3.attn.add_q_proj.bias.data = dit_block_imp.context_to_kqv.bias.data[:C].clone()
-        dit_block_SD3.attn.add_k_proj.weight.data = dit_block_imp.context_to_kqv.weight.data[C:2*C,:].clone()
-        dit_block_SD3.attn.add_k_proj.bias.data = dit_block_imp.context_to_kqv.bias.data[C:2*C].clone()
-        dit_block_SD3.attn.add_v_proj.weight.data = dit_block_imp.context_to_kqv.weight.data[2*C:,:].clone()
-        dit_block_SD3.attn.add_v_proj.bias.data = dit_block_imp.context_to_kqv.bias.data[2*C:].clone()
+        dit_block_SD3.attn.add_q_proj.weight.data = dit_block_imp.context_to_qkv.weight.data[:C,:].clone()
+        dit_block_SD3.attn.add_q_proj.bias.data = dit_block_imp.context_to_qkv.bias.data[:C].clone()
+        dit_block_SD3.attn.add_k_proj.weight.data = dit_block_imp.context_to_qkv.weight.data[C:2*C,:].clone()
+        dit_block_SD3.attn.add_k_proj.bias.data = dit_block_imp.context_to_qkv.bias.data[C:2*C].clone()
+        dit_block_SD3.attn.add_v_proj.weight.data = dit_block_imp.context_to_qkv.weight.data[2*C:,:].clone()
+        dit_block_SD3.attn.add_v_proj.bias.data = dit_block_imp.context_to_qkv.bias.data[2*C:].clone()
         if dit_block_SD3.attn.to_add_out is not None:
             dit_block_SD3.attn.to_add_out.weight.data = dit_block_imp.context_attn_Wout.weight.data.clone()
             dit_block_SD3.attn.to_add_out.bias.data = dit_block_imp.context_attn_Wout.bias.data.clone()
 
         if i in dual_attention_layers:
             # Wkqv, x2
-            dit_block_SD3.attn2.to_q.weight.data = dit_block_imp.latent_to_kqv_x2.weight.data[:C,:].clone()
-            dit_block_SD3.attn2.to_q.bias.data = dit_block_imp.latent_to_kqv_x2.bias.data[:C].clone()
-            dit_block_SD3.attn2.to_k.weight.data = dit_block_imp.latent_to_kqv_x2.weight.data[C:2*C,:].clone()
-            dit_block_SD3.attn2.to_k.bias.data = dit_block_imp.latent_to_kqv_x2.bias.data[C:2*C].clone()
-            dit_block_SD3.attn2.to_v.weight.data = dit_block_imp.latent_to_kqv_x2.weight.data[2*C:,:].clone()
-            dit_block_SD3.attn2.to_v.bias.data = dit_block_imp.latent_to_kqv_x2.bias.data[2*C:].clone()
-            dit_block_SD3.attn2.to_out[0].weight.data = dit_block_imp.latent_attn_Wout_x2.weight.data.clone()
-            dit_block_SD3.attn2.to_out[0].bias.data = dit_block_imp.latent_attn_Wout_x2.bias.data.clone()
+            dit_block_SD3.attn2.to_q.weight.data = dit_block_imp.latent_dual_to_qkv.weight.data[:C,:].clone()
+            dit_block_SD3.attn2.to_q.bias.data = dit_block_imp.latent_dual_to_qkv.bias.data[:C].clone()
+            dit_block_SD3.attn2.to_k.weight.data = dit_block_imp.latent_dual_to_qkv.weight.data[C:2*C,:].clone()
+            dit_block_SD3.attn2.to_k.bias.data = dit_block_imp.latent_dual_to_qkv.bias.data[C:2*C].clone()
+            dit_block_SD3.attn2.to_v.weight.data = dit_block_imp.latent_dual_to_qkv.weight.data[2*C:,:].clone()
+            dit_block_SD3.attn2.to_v.bias.data = dit_block_imp.latent_dual_to_qkv.bias.data[2*C:].clone()
+            dit_block_SD3.attn2.to_out[0].weight.data = dit_block_imp.latent_dual_attn_Wout.weight.data.clone()
+            dit_block_SD3.attn2.to_out[0].bias.data = dit_block_imp.latent_dual_attn_Wout.bias.data.clone()
 
         # mlp
         dit_block_SD3.ff.net[0].proj.weight.data = dit_block_imp.latent_mlp.lin1.weight.data.clone()
@@ -663,7 +660,7 @@ if __name__ == "__main__":
     out_imp = model(latent, coarse_captions, pooled_captions, timesteps)
     loss_imp = out_imp.sum()
     loss_imp.backward()
-    first_layer_grad_imp = model.to_patches.to_patch.weight.grad
+    first_layer_grad_imp = model.to_patch.conv.weight.grad
 
     out_SD3 = SD3(latent, coarse_captions, pooled_captions, timesteps)
     loss_SD3 = out_SD3[0].sum()
