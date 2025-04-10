@@ -7,7 +7,6 @@
 #include <unordered_set>
 
 
-
 void layernorm(float* x, float* y, float* mean, float* rstd, float* w, float* bias, float eps, int B, int T, int C){
 
     const bool use_weight = (w != nullptr);
@@ -1151,6 +1150,7 @@ void mlp(float*x, float* output, float* h1, float* W1, float* b1, float* W2, flo
 
 void mlp_v2(float*x, float* output, float* W1, float* b1, float* W2, float* b2, int B, int C_in, int C_hid, int C_out, 
     std::function<float (float)> activation){
+    // TO FIX
     // MLP without storing an intermediate matrix of shape (B, C_hid)
     // Linear -> activation -> Linear
 
@@ -1745,9 +1745,9 @@ torch::Tensor DiT_forward(
     partial_linear(y, get_ptr("ada_ln_out.linear.weight"), get_ptr("ada_ln_out.linear.bias"), y_hid , B, emb_dim, emb_dim, 2*emb_dim, 0*emb_dim);
     partial_linear(y, get_ptr("ada_ln_out.linear.weight"), get_ptr("ada_ln_out.linear.bias"), y_hid2, B, emb_dim, emb_dim, 2*emb_dim, 1*emb_dim);
     scale_and_shift(x_hid, x_hid, y_hid2, y_hid, B, Tx, emb_dim);
-    // linear written into x, (B, Tx, emb_dim) -> (B, Tx, temp:= patch * patch * C_in)
-    int temp = patch_size * patch_size * C_in;
-    linear(x_hid, get_ptr("linear_out.weight"), get_ptr("linear_out.bias"), x, B*Tx, emb_dim, temp);
+    // linear written into x, (B, Tx, emb_dim) -> (B, Tx, PPC:= patch * patch * C_in)
+    int PPC = patch_size * patch_size * C_in;
+    linear(x_hid, get_ptr("linear_out.weight"), get_ptr("linear_out.bias"), x, B*Tx, emb_dim, PPC);
 
     // Rearrange x (B, Tx, patch * patch * C_in) -> (B, C_in, H, W) where Tx = H_*W_, H = H_*patch, W = W_*patch
     float* x_out_ = x_out.data_ptr<float>();
@@ -1756,11 +1756,16 @@ torch::Tensor DiT_forward(
             float* x_out_bc = x_out_ + b * C_in * H * W + c * H * W;
             for (int h_=0; h_<H_; h_++){
                 for (int w_=0; w_<W_; w_++){
+                    int t = h_*W_+w_;
                     for (int ph=0; ph<patch_size; ph++){
+                        int h = h_ * patch_size + ph;
                         for (int pw=0; pw<patch_size; pw++){
+                            int w = w_ * patch_size + pw;
+                            int ppc = ph * patch_size * C_in + pw * C_in + c;
                             // x_out[b, c, h_*patch + ph, w_*patch + pw] = x[b, h_*W_+w_, ph * patch_size * C_in + pw * C_in + c]
-                            x_out_bc[(h_*patch_size + ph) * W + w_*patch_size + pw] = 
-                                x[b * Tx * temp + (h_ * W_ + w_) * temp + ph * patch_size * C_in + pw * C_in + c];
+                            // equivalent to (with the definitions above): x_out[b, c, h, w] = x[b, t, ppc]
+                            x_out_bc[(h) * W + (w)] = 
+                                x[b * Tx * PPC + (t) * PPC + (ppc)];
                         }
                     }
                 }
@@ -1796,45 +1801,6 @@ torch::Tensor DiT_forward(
     return x_out;
 }
 
-torch::Tensor temp(std::unordered_map<std::string, torch::Tensor>& params){
-    torch::Tensor W1 = params["timestep_mlp.0.weight"];
-    torch::Tensor b1 = params["timestep_mlp.0.bias"];
-    torch::Tensor W2 = params["timestep_mlp.2.weight"];
-    torch::Tensor b2 = params["timestep_mlp.2.bias"];
-    torch::Tensor y = torch::randn({2,256});
-    float* x = new float[2*256];
-    float* hid = new float[2*256];
-    std::cout << "Performing mlp" << std::endl;
-    mlp(x, y.data_ptr<float>(), hid, 
-        W1.data_ptr<float>(), b1.data_ptr<float>(), W2.data_ptr<float>(), b2.data_ptr<float>(),
-        2, 256, 256, 256, silu
-    );
-    return y;
-}
-
-torch::Tensor temp2(std::unordered_map<std::string, torch::Tensor>& params){
-    int B = 2;
-    int emb_dim = 256;
-    
-    torch::Tensor y = torch::randn({B, emb_dim});
-    float* x = new float[B*emb_dim];
-    float* hid = new float[B*emb_dim];
-
-    torch::Tensor W1 = params["timestep_mlp.0.weight"];
-    torch::Tensor b1 = params["timestep_mlp.0.bias"];
-    torch::Tensor W2 = params["timestep_mlp.2.weight"];
-    torch::Tensor b2 = params["timestep_mlp.2.bias"];
-
-    std::cout << "Performing mlp" << std::endl;
-    mlp(x, y.data_ptr<float>(),  hid,
-        W1.data_ptr<float>(), b1.data_ptr<float>(), 
-        W2.data_ptr<float>(), b2.data_ptr<float>(),
-        B, 256, emb_dim, emb_dim, silu);
-    
-    // delete[] hid;
-    // delete[] x;
-}
-
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
     m.def("layer_norm", &LayerNorm_forward, "LayerNorm forward");
     m.def("layer_norm_backward", &LayerNorm_backward, "LayerNorm backward");
@@ -1857,6 +1823,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m){
     m.def("mlp", &MLP, "MLP");
     m.def("Dit_block", &DiT_block_forward, "Stable diffusion's DiT block");
     m.def("DiT", &DiT_forward, "SD3.5 medium");
-    m.def("test", &temp, "");
-    m.def("test2", &temp2, "");
 }
