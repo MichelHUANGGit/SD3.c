@@ -1,20 +1,20 @@
 import torch as pt
 from torch import nn, Tensor
-import custom_modules_cpp
+import custom_modules as F2
 
 
 if __name__ == "__main__":
-    B,T = 2,144
+    B,T = 16,128
     C_in, C_hid, C_out = 256,1024,256
-    activation = "GELU"
+    activation = "SiLU"
     kwargs = {"approximate" : "tanh"} if activation == "GELU" else {}
 
     lin1 = nn.Linear(C_in, C_hid)
     act = getattr(nn, activation)(**kwargs)
-    # act = nn.GELU(approximate="tanh")
     lin2 = nn.Linear(C_hid, C_out)
 
     x = pt.randn((B, C_in))
+    x_clone = x.clone()
     y_true = lin2(act(lin1(x)))
 
 

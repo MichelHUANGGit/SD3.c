@@ -1,6 +1,6 @@
 import torch as pt
 from torch.nn import functional as F
-import custom_modules_cpp as F2
+import custom_modules as F2
 from code import interact
 # pt.set_printoptions(precision=8, sci_mode=False)
 

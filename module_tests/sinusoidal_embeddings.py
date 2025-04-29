@@ -1,6 +1,6 @@
 import torch as pt
 from torch import Tensor
-import custom_modules_cpp as F2
+import custom_modules as F2
 
 
 def get_sinusoidal_embedding(t:Tensor, emb_dim:int) -> Tensor:

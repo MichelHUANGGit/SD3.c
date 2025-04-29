@@ -1,5 +1,5 @@
 import torch as pt
-import custom_modules_cpp as F
+import custom_modules as F
 from code import interact
 from inspect import signature
 from modules import MMDiT

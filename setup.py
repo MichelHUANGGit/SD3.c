@@ -1,8 +1,11 @@
 from setuptools import setup, Extension
-from torch.utils import cpp_extension
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-setup(name="custom_modules_cpp", 
-      ext_modules=[cpp_extension.CppExtension('custom_modules_cpp', ['modules.cpp'])],
-      cmdclass={"build_ext": cpp_extension.BuildExtension}
+setup(
+      name="custom_modules", 
+      ext_modules=[
+          CUDAExtension("custom_modules", ["modules.cpp", "cuda/dit.cu"]),
+      ],
+      cmdclass={"build_ext": BuildExtension}
 )
 

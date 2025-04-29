@@ -1,6 +1,6 @@
 import torch
 from torch import nn, Tensor
-import custom_modules_cpp as F2
+import custom_modules as F2
 from code import interact
 from time import time
 # torch.set_printoptions(sci_mode=False)
@@ -56,7 +56,7 @@ if __name__ == "__main__":
     K = torch.randn((B,L,C), requires_grad=True)
     V = torch.randn((B,L,C), requires_grad=True)
 
-    # Pytorch written module
+    # Pytorch-written module
     attn = Attention(num_heads)
     
     # Pytorch API

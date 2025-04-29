@@ -299,8 +299,8 @@ class MM_DiT_Block(nn.Module):
         ############################################### ATTENTION ####################################################
 
         # Concatenate latent and context embeddings for self+cross attention, along tokens dimension
-        K = pt.concat([kc, kx], dim=self.T_id).transpose(1,2) # (B, attn_heads, Tx+Tc, C//attn_heads)
         Q = pt.concat([qc, qx], dim=self.T_id).transpose(1,2) # (B, attn_heads, Tx+Tc, C//attn_heads)
+        K = pt.concat([kc, kx], dim=self.T_id).transpose(1,2) # (B, attn_heads, Tx+Tc, C//attn_heads)
         V = pt.concat([vc, vx], dim=self.T_id).transpose(1,2) # (B, attn_heads, Tx+Tc, C//attn_heads)
 
         attn_output = F.scaled_dot_product_attention(Q, K, V) # self attention + cross attention between context and image

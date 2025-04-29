@@ -1,5 +1,5 @@
 import torch
-import custom_modules_cpp as F2
+import custom_modules as F2
 
 class SoftmaxFunction(torch.autograd.Function):
     @staticmethod
